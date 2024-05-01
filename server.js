@@ -2,15 +2,19 @@ const express = require('express');
 const { Server } = require('ws');
 const https = require('https');
 const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const readline = require('readline');
+const { RTCPeerConnection, RTCSessionDescription } = require('@roamhq/wrtc');
 
+const PORT = 8999;
 const SSLCERTS_DIR = path.resolve(os.homedir(), 'sslcerts');
 const app = express();
 
 // SSL credentials
 const options = {
-  key: fs.readFileSync(path.resolve(SSLCERTS_DIR, 'server.key')),
-  cert: fs.readFileSync(path.resolve(SSLCERTS_DIR, 'server.cert'))
+  key: fs.readFileSync(path.resolve(SSLCERTS_DIR, 'privkey.pem')),
+  cert: fs.readFileSync(path.resolve(SSLCERTS_DIR, 'fullchain.pem'))
 };
 
 const server = https.createServer(options, app);
@@ -26,95 +30,141 @@ app.get('/', (req, res) => {
       <title>Jellyness - WebRTC Chat</title>
     </head>
     <body>
-      <h2>WebRTC Chat</h2>
+      <h2>Jellyness</h2>
       <pre id="messages"></pre>
       <input type="text" id="messageBox" placeholder="Type a message...">
       <script>
-        const ws = new WebSocket('ws://' + location.host);
-        const messages = document.getElementById('messages');
-        const messageBox = document.getElementById('messageBox');
+        const ws = new WebSocket('wss://' + location.host);
+        const pc = new RTCPeerConnection();
+        let chatChannel;
 
-        ws.onmessage = ({ data }) => {
-          messages.textContent += \`\n${data}\`;
-        };
-
-        messageBox.onkeypress = (e) => {
-          if (e.key === 'Enter') {
-            ws.send(messageBox.value);
-            messageBox.value = '';
+        pc.onicecandidate = event => {
+          if (event.candidate) {
+            ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
           }
         };
+
+        pc.ondatachannel = event => {
+          chatChannel = event.channel;
+          chatChannel.onmessage = e => {
+            document.getElementById('messages').textContent += \`\n\${e.data}\`;
+          };
+          chatChannel.onopen = () => console.log('Channel opened');
+          chatChannel.onclose = () => console.log('Channel closed');
+        };
+
+        ws.onmessage = async ({data}) => {
+          const msg = JSON.parse(data);
+          if (msg.type === 'offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+          } else if (msg.type === 'candidate') {
+            await pc.addIceCandidate(msg.candidate);
+          }
+        };
+
+        document.getElementById('messageBox').addEventListener('keypress', function(e) {
+          if (e.key === 'Enter' && chatChannel) {
+            if (this.value.startsWith('/name ')) {
+              nickname = this.value.split(' ')[1];
+              document.getElementById('messages').textContent += \`\nName changed to \${nickname}\`;
+            } else {
+              chatChannel.send(this.value);
+            }
+            this.value = '';
+          }
+        });
       </script>
     </body>
     </html>
   `);
 });
 
-let adminId = null;
-const peers = new Map();
+let adminChannel = null;
+const peers = {};
 
 wss.on('connection', function(ws) {
   const id = Date.now();
+  const pc = new RTCPeerConnection();
   let nickname = `User${id}`;
 
-  console.log(`Secure connection received: ${id}`);
-  peers.set(id, { ws, nickname });
+  peers[id] = { ws, pc, nickname };
 
-  ws.on('message', function(message) {
-    console.log(`Received: ${message} from ${nickname}`);
-
-    if (message.startsWith('/name ')) {
-      const newName = message.split(' ')[1];
-      peers.get(id).nickname = newName;
-      ws.send(`Name changed to ${newName}`);
-      return;
+  pc.onicecandidate = event => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'candidate', candidate: event.candidate }));
     }
+  };
 
-    const formattedMessage = `${id === adminId ? '*' : ''}${nickname}: ${message}`;
-    for (let [peerId, peer] of peers) {
-      if (peer.ws.readyState === ws.OPEN) {
-        peer.ws.send(formattedMessage);
-      }
+  const channel = pc.createDataChannel('chat');
+  channel.onmessage = event => {
+    console.log(`${nickname}: ${event.data}`);
+    broadcastMessage(`${nickname}: ${event.data}`, id);
+  };
+  channel.onopen = () => {
+    console.log(`Data channel with ${id} opened`);
+    peers[id].channel = channel;
+  };
+  channel.onclose = () => console.log(`Data channel with ${id} closed`);
+
+  ws.on('message', async message => {
+    const data = JSON.parse(message);
+    console.log(data);
+    switch (data.type) {
+      case 'offer':
+        await pc.setRemoteDescription(new RTCSessionDescription(data));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', sdp: answer.sdp }));
+        break;
+      case 'candidate':
+        if (data.candidate) {
+          await pc.addIceCandidate(data.candidate);
+        }
+        break;
+      case 'bye':
+        pc.close();
+        break;
     }
   });
 
   ws.on('close', () => {
-    peers.delete(id);
-    console.log(`Connection closed: ${id}`);
+    console.log(`WebSocket with ${id} closed`);
+    pc.close();
+    delete peers[id];
   });
 });
 
-// REPL for command line interaction
+server.listen(PORT, () => {
+  console.log(`Secure server running on https://localhost:${PORT}`);
+});
+
+// Broadcast message to all users
+function broadcastMessage(message, senderId) {
+  Object.keys(peers).forEach(id => {
+    if (peers[id].channel && peers[id].channel.readyState === 'open' && id != senderId) {
+      peers[id].channel.send(message);
+    }
+  });
+}
+
+// Admin REPL to interact with connected users
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
-  prompt: 'talk> '
+  prompt: 'ADMIN> '
 });
-
-adminId = Date.now();  // Assigning admin ID on start
-peers.set(adminId, { ws: null, nickname: 'Admin' });
 
 rl.prompt();
-
-rl.on('line', (line) => {
+rl.on('line', line => {
   if (line.startsWith('/name ')) {
     const newName = line.split(' ')[1];
-    peers.get(adminId).nickname = newName;
     console.log(`Admin name changed to ${newName}`);
-    rl.prompt();
-    return;
-  }
-
-  const message = `*${peers.get(adminId).nickname}: ${line}`;
-  for (let [id, peer] of peers) {
-    if (peer.ws && peer.ws.readyState === peer.ws.OPEN) {
-      peer.ws.send(message);
-    }
+  } else {
+    broadcastMessage(`*Admin: ${line}`, null);
   }
   rl.prompt();
-});
-
-server.listen(8999, () => {
-  console.log('Secure server running on https://localhost:3000');
 });
 

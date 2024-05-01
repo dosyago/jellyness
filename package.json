@@ -1,0 +1,30 @@
+{
+  "name": "jellyness",
+  "version": "1.0.0",
+  "description": "webrtc chat",
+  "main": "server.js",
+  "scripts": {
+    "test": "node server.js",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/dosyago/jellyness.git"
+  },
+  "keywords": [
+    "webrtc",
+    "chat"
+  ],
+  "author": "@dosy",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/dosyago/jellyness/issues"
+  },
+  "homepage": "https://github.com/dosyago/jellyness#readme",
+  "dependencies": {
+    "@roamhq/wrtc": "^0.7.3",
+    "express": "^4.19.2",
+    "patch-package": "^8.0.0",
+    "ws": "^8.17.0"
+  }
+}
